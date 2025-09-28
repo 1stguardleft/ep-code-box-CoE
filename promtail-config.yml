@@ -1,0 +1,175 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /positions/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    external_labels:
+      collector: coe-promtail
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+
+    pipeline_stages:
+      # Parse Docker JSON log format and extract fields
+      - docker: {}
+      # Skip records beyond Loki's retention window (avoids timestamp-too-old errors)
+      - drop:
+          older_than: 168h
+      # Parse Nginx access logs and expose HTTP labels
+      - match:
+          selector: '{service="nginx"}'
+          stages:
+            - regex:
+                expression: '^(?P<remote_addr>[^ ]+) - (?P<host>[^ ]+) \[(?P<time_local>[^\]]+)\] "(?P<method>[A-Z]+) (?P<path>[^" ]*)(?: (?P<http_protocol>HTTP/[^"]+))?" (?P<status>\d{3}) (?P<body_bytes_sent>\d+)(?: "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)" "(?P<http_x_forwarded_for>[^"]*)")?'
+            - labels:
+                method:
+                path:
+                status:
+                host:
+      # Parse FastAPI/Gunicorn access logs to expose HTTP labels for backend services
+      - match:
+          selector: "{service=~\"coe-backend|coe-ragpipeline\"} |= \" - \\\"\""
+          stages:
+            - regex:
+                expression: "^(?P<level>[A-Z]+): (?P<time_local>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) - (?P<client_addr>[^ ]+) - \"(?P<method>[A-Z]+) (?P<path>[^\" ]*)(?: (?P<http_protocol>HTTP/[^\"]+))?\" (?P<status>\\d{3})(?: (?P<reason>.*))?$"
+            - labels:
+                method:
+                path:
+                status:
+                client_addr:
+
+    relabel_configs:
+      # Ensure job label is always present for Loki
+      - target_label: job
+        replacement: docker
+
+      # read each container's json log file
+      - source_labels: ['__meta_docker_container_id']
+        target_label: __path__
+        replacement: /var/lib/docker/containers/$1/*-json.log
+        action: replace
+
+      # Default env label to 'local'; later rules may override
+      - target_label: env
+        replacement: local
+        action: replace
+
+      # Static label to simplify querying per collector
+      - target_label: source
+        replacement: docker
+
+      # container name (strip leading slash)
+      - source_labels: ['__meta_docker_container_name']
+        target_label: container
+        regex: '/(.*)'
+        replacement: '$1'
+
+      # compose project and service (from Docker labels)
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: compose_project
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: service
+
+      # derive env from compose service suffix if present: *-(dev|prod|edge)
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: env
+        regex: '.*-(dev|prod|edge)'
+        replacement: '$1'
+
+      # derive env from project suffix as fallback: coe-(dev|prod|edge)
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: env
+        regex: '.*-(dev)'
+        replacement: '$1'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: env
+        regex: '.*-(prod)'
+        replacement: '$1'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: env
+        regex: '.*-(edge)'
+        replacement: '$1'
+
+      # app: base service name without env suffix (e.g., coe-backend[-dev] -> coe-backend)
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: app
+        regex: '^(.*?)(?:-(dev|prod|edge))?$'
+        replacement: '$1'
+
+      # Optional custom labels if present on services
+      - source_labels: ['__meta_docker_container_label_logging_service']
+        target_label: app
+        regex: '(.*)'
+        replacement: '$1'
+      - source_labels: ['__meta_docker_container_label_logging_env']
+        target_label: logging_env
+        regex: '(.*)'
+        replacement: '$1'
+
+      # Drop logs from the monitoring stack itself (reduce noise)
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        regex: 'coe-monitoring'
+        action: drop
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        regex: 'loki|promtail|grafana'
+        action: drop
+
+  # File-based logs from host (prod/dev) directories
+  - job_name: app_files_prod
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: app_files
+          env: prod
+          service: coe-backend
+          app: coe-backend
+          __path__: /host-logs/coe-backend/prod/**/*.log
+      - targets: [localhost]
+        labels:
+          job: app_files
+          env: prod
+          service: coe-ragpipeline
+          app: coe-ragpipeline
+          __path__: /host-logs/coe-ragpipeline/prod/**/*.log
+
+  - job_name: app_files_dev
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: app_files
+          env: dev
+          service: coe-backend
+          app: coe-backend
+          __path__: /host-logs/coe-backend/dev/**/*.log
+      - targets: [localhost]
+        labels:
+          job: app_files
+          env: dev
+          service: coe-ragpipeline
+          app: coe-ragpipeline
+          __path__: /host-logs/coe-ragpipeline/dev/**/*.log
+
+  # File-based logs from local compose (repo) directories
+  - job_name: app_files_local
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: app_files
+          env: local
+          service: coe-backend
+          app: coe-backend
+          __path__: /local-logs/coe-backend/**/*.log
+      - targets: [localhost]
+        labels:
+          job: app_files
+          env: local
+          service: coe-ragpipeline
+          app: coe-ragpipeline
+          __path__: /local-logs/coe-ragpipeline/**/*.log
